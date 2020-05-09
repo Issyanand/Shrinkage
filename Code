@@ -1,0 +1,314 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize
+import pandas_datareader.data as web
+
+class Covariance_Shrinkage:
+    def __init__(self,stock_returns):
+        self.stock_returns = stock_returns
+        self.t = len(stock_returns)
+        self.n = len(stock_returns.iloc[0,:])
+        self.meanx = stock_returns.mean()
+        self.x = stock_returns - self.meanx
+
+    def get_sample_cov_mat(self):
+        sample = (1/self.t)*(self.x.transpose() @ self.x)
+        return sample
+    
+    def get_shrunk_cov_mat(self):
+        #prior (F)
+        sample = self.get_sample_cov_mat()
+        var = np.diag(sample)
+        sqrtvar = np.sqrt(var)
+        #getting rBar
+        a = np.array(self.n*[list(sqrtvar)]).transpose()
+        b = sample / (a*a.transpose())
+        c = np.sum(b)
+        d = np.sum(c) - self.n
+        rBar = d/(self.n*(self.n-1))
+        #getting F
+        prior = rBar*(a*a.transpose())
+        np.fill_diagonal(prior,var)
+
+
+        #pi-hat
+        y = self.x**2
+        phiMat = y.transpose()@y/self.t - 2*(self.x.transpose()@self.x)*sample/self.t + sample**2
+        phi = np.sum(np.sum(phiMat))
+
+        #rho-hat
+        term1 = ((self.x**3).transpose() @ self.x) / self.t
+        help_mat = self.x.transpose() @ self.x/self.t
+        helpDiag = np.diag(help_mat)
+        term2 = np.array(self.n*[list(helpDiag)]).transpose() * sample
+        term3 = help_mat * np.array(self.n*[list(var)]).transpose()
+        term4 = np.array(self.n*[list(var)]).transpose() * sample
+        thetaMat = np.array(term1 - term2 - term3 +term4)
+        np.fill_diagonal(thetaMat,0)
+        sqrtvar1 = pd.DataFrame(sqrtvar)
+        rho = np.sum(np.diag(phiMat)) + rBar * np.sum(np.sum( ((1/sqrtvar1) @ sqrtvar1.transpose()) *thetaMat ))
+
+        #gamma-hat
+        gamma = np.linalg.norm(sample-prior,'fro')**2
+
+        #shrinkage constant
+        kappa = (phi-rho)/gamma
+        shrinkage = max(0,min(1,kappa/self.t))
+        sigma = shrinkage*prior + (1-shrinkage)*sample
+        return sigma, shrinkage
+
+    def get_pca_cov_mat(self,var):
+        sample = self.get_sample_cov_mat()
+        D, U = np.linalg.eigh(sample)
+        D = D[::-1]
+        U = U[:,::-1]
+        var_contribution = D/np.sum(D)
+        cum_var_contribution = np.cumsum(var_contribution)
+        threshold_index = next(x for x, val in enumerate(cum_var_contribution) if val > var)
+        D_pca = np.diag(list(D[0:threshold_index+1]) + (len(D) - threshold_index-1)*[0])
+        return U@D_pca@U.T
+    
+class Optimizer:
+
+    def __init__(self, returns, benchmark = None):
+        self.returns = returns
+        self.mean_returns = np.array([self.returns.mean()]).transpose()
+        self.n = len(self.mean_returns)
+        self.cons= [{'type':'eq','fun': lambda x: np.sum(x)-1}]
+        self.no_short_bounds = self.n*[(0,0.1)]
+    
+    def calc_expected_portfolio_return(self,w):
+        w = np.array([w]).transpose() #making w a column vector
+        exp_ret = self.mean_returns.transpose() @ w 
+        return exp_ret[0][0]
+    
+    def calc_portfolio_variance(self,w,cov_mat):
+        w = np.array([w]).transpose() #making w a column vector
+        variance = w.transpose() @ cov_mat @ w
+        return variance[0][0]
+    
+    def minimize_variance(self,cov_mat, short_sales = 'no'):
+        guess = self.n*[1/self.n] #guessing equally weighted portfolio
+        if short_sales =='yes':
+            bound = None
+        else:
+            bound = self.no_short_bounds        
+        optimized_weights = minimize(self.calc_portfolio_variance, guess, bounds = bound,constraints = self.cons, args = cov_mat, method= 'SLSQP',options={ 'ftol': 1e-09})['x']
+        return optimized_weights
+
+    def mean_variance_objective(self,w,cov_mat,a):
+        #returns the negative of the function we want to maximize, so we can minimize instead
+        objective = self.calc_expected_portfolio_return(w) - a*self.calc_portfolio_variance(w,cov_mat)
+        return - objective
+        
+    def optmize_mean_variance(self,cov_mat,a,short_sales = 'no'):
+        guess = self.n*[1/self.n]
+        if short_sales =='yes':
+            bound = None
+        else:
+            bound = self.no_short_bounds 
+        optimized_weights = minimize(self.mean_variance_objective, guess, bounds = bound,constraints = self.cons, args = (cov_mat,a), method= 'SLSQP',options={ 'ftol': 1e-09})['x']
+        return optimized_weights
+    
+def weight_matrix(returns, begin_training, end_training, training_period, prediction_period,risk_coef,var):
+    '''
+    returns a matrix of rebalanced dates for each month after 1 period has passed
+    returns = matrix of returns
+    begin_training = beginning date of training period
+    end_training = end date of training period
+    training_period = number of months in training period
+    prediction_period = number of months/weeks we will look at after the training period
+    risk_coeff = risk aversion coefficient
+    var = threshhold
+    '''
+    data = returns.loc[begin_training:,:]
+    weights1 = pd.DataFrame(columns=returns.columns) #for normal cov matrix mean var
+    weights2 = pd.DataFrame(columns=returns.columns) #for shrunk cov matrix mean var
+    weights3 = pd.DataFrame(columns=returns.columns) #for normal cov matrix min var
+    weights4 = pd.DataFrame(columns=returns.columns) #for shrunk cov matrix min var
+    weights5 = pd.DataFrame(columns=returns.columns) #for pca cov matrix min var
+    weights6 = pd.DataFrame(columns=returns.columns) #for pca cov matrix min var
+    
+    l = list(range(training_period+1,training_period+prediction_period+1))
+    
+    for i in l:
+        
+        #matrix of required returns
+        reqd_data = data.iloc[i-training_period-1:i-1,:]
+        
+        #get covariance matrices
+        test = Covariance_Shrinkage(reqd_data)
+        shrunk_mat = test.get_shrunk_cov_mat()[0]
+        cov = test.get_sample_cov_mat()
+        pca = test.get_pca_cov_mat(var)
+        
+        #optimize the weights
+        opt = Optimizer(reqd_data)
+        w1 = opt.optmize_mean_variance(cov,risk_coef, short_sales='no')
+        w2 = opt.optmize_mean_variance(shrunk_mat,risk_coef, short_sales='no')
+        w3 = opt.minimize_variance(cov,short_sales='no')
+        w4 = opt.minimize_variance(shrunk_mat,short_sales='no')
+        w5 = opt.optmize_mean_variance(pca,risk_coef,short_sales='no')
+        w6 = opt.minimize_variance(pca,short_sales='no')
+        
+        #enter the optimized weights into dataframes
+        weights1.loc[i-training_period-1] = w1
+        weights2.loc[i-training_period-1] = w2
+        weights3.loc[i-training_period-1] = w3
+        weights4.loc[i-training_period-1] = w4
+        weights5.loc[i-training_period-1] = w5
+        weights6.loc[i-training_period-1] = w6
+    
+        print('weights done for',i)
+        
+    return weights1, weights2, weights3, weights4, weights5, weights6
+
+def weights_deviation(weights):
+    ''' returns a list of standard deviations of all the stocks'''
+    
+    return weights.std(axis = 0)
+
+def port_return(returns, weights, begin, end):
+    
+    returns = np.matrix(returns.loc[begin:end,:])
+    weights = np.matrix(weights)
+    answer = np.matmul(returns,weights.T)
+    
+    return np.diag(answer)
+    
+
+def inf_ratio(returns, weights, sp_ret, begin, end, n):
+     ''' 
+     asset = matrix of stock returns
+     weights = optimized list of weights for each stock
+     benchmark = series of s&p returns
+     '''
+     
+     port_ret = port_return(returns,weights,begin,end)
+     
+     port_ret = np.matrix(port_ret)
+     sp_ret = np.matrix(sp_ret)
+     excess_ret = (port_ret - sp_ret)
+     
+     inf = n*np.mean(excess_ret) / (np.sqrt(n)*np.std(excess_ret))
+     
+     return inf
+    
+def cumulative_rets_graph(port_return_list,labels_list):
+    
+    #port_return_list is a list of all the port returns you want to plot on the graph
+    x = [i for i in range(len(port_return_list[0]))]
+    for j in range(len(port_return_list)):
+        y = np.cumprod(1+port_return_list[j])
+        plt.plot(x, y, label=labels_list[j])
+    plt.xlabel('Months')
+    plt.ylabel('Cumulative Returns')
+    plt.legend()
+    plt.title('Cumulative Returns')
+    plt.show()
+
+
+#Not sure if this is useful or not 
+def weights_std_graph(std_list,labels_list):
+    
+    x = std_list[0].index
+    color=iter(plt.cm.rainbow(np.linspace(0,1,len(std_list))))
+    for j in range(len(std_list)):
+        c = next(color)
+        y = std_list[j]
+        plt.scatter(x,y,label=labels_list[j], c=c)
+        plt.axhline(y=np.mean(std_list[j]), c=c)
+    plt.xlabel('Stocks')
+    plt.xticks(rotation=90)
+    plt.ylabel('Standard Deviations')
+    plt.legend()
+    plt.title('Standard Deviations of the Weights')
+    plt.show()
+
+
+
+if __name__ == '__main__':
+    
+    george = r"C:\Users\jojis\OneDrive\Documents\GitHub\mf796\data\adjclosepx-monthly.csv"
+    robbie = "/home/robbie/Documents/MSMF/Spring2020/MF796/project/data/adjclosepx.csv"
+    issy = "adjclosepx-monthly.csv"
+    gauri = r"C:\Users\gauri\OneDrive\Desktop\Spring 2020\MF 796\Project\adjclosepx-monthly.csv"
+    
+    stock_prices = pd.read_csv(gauri, index_col="Date")
+    stock_prices.dropna(inplace=True)
+    stock_returns = stock_prices.pct_change(1)
+    
+    begin_training = '01/01/2016' #monthly
+    end_training = '01/12/2019'#monthly
+    n_period = 36 #number of months in one period
+    prediction_period = 12  #monthly
+    
+#    begin_training = '01/01/2018' #weekly
+#    end_training = '30/12/2019'   #weekly
+#    n_period = 53 #number of weeks in one period
+#    prediction_period = 52 #weekly
+    
+    w = weight_matrix(stock_returns, begin_training, end_training, n_period, prediction_period,2,0.9)
+    sample_weights_meanvar = w[0]
+    shrunk_weights_meanvar = w[1]
+    sample_weights_minvar = w[2]
+    shrunk_weights_minvar = w[3]
+    pca_weights_meanvar = w[4]
+    pca_weights_minvar = w[5]
+    
+    begin = '01/02/2019'#01/01/2019' #monthly
+    end = '01/01/2020'#01/12/2019'   #monthly
+
+#    begin = '14/01/2019'#07/01/2019' #weekly
+#    end = '06/01/2020'#30/12/2019'#weekly
+    
+    sample_ret_meanvar = port_return(stock_returns,sample_weights_meanvar,begin,end)   
+    shrunk_ret_meanvar = port_return(stock_returns,shrunk_weights_meanvar,begin,end)  
+    sample_ret_minvar = port_return(stock_returns,sample_weights_minvar,begin,end)
+    shrunk_ret_minvar = port_return(stock_returns,shrunk_weights_minvar,begin,end)
+    pca_ret_meanvar = port_return(stock_returns,pca_weights_meanvar,begin,end)
+    pca_ret_minvar = port_return(stock_returns,pca_weights_minvar,begin,end) 
+    
+    cumulative_rets_graph([sample_ret_meanvar,shrunk_ret_meanvar,sample_ret_minvar,shrunk_ret_minvar,pca_ret_meanvar,pca_ret_minvar],\
+                       ['Sample Cov MeanVar','Shrunk Cov MeanVar','Sample Cov MinVar','Shrunk Cov MinVar','PCA MeanVar','PCA MinVar'])
+    
+    
+    std_sample_meanvar = weights_deviation(sample_weights_meanvar)
+    std_shrunk_meanvar = weights_deviation(shrunk_weights_meanvar)
+    std_sample_minvar = weights_deviation(sample_weights_minvar)
+    std_shrunk_minvar = weights_deviation(shrunk_weights_minvar)
+    std_pca_meanvar = weights_deviation(pca_weights_meanvar)
+    std_pca_minvar = weights_deviation(pca_weights_minvar)
+    
+    weights_std_graph([std_sample_meanvar,std_shrunk_meanvar,std_sample_minvar,std_shrunk_minvar,std_pca_meanvar,std_pca_minvar],\
+                  ['Sample Cov MeanVar','Shrunk Cov MeanVar','Sample Cov MinVar','Shrunk Cov MinVar','PCA MeanVar','PCA MinVar'])
+
+
+    sp = web.get_data_yahoo('^GSPC','2018-12-31','2020-02-01', interval='m') #monthly
+#    sp = web.get_data_yahoo('^GSPC','2018-12-31','2020-01-01', interval='w') #weekly
+    
+    sp = sp['Adj Close']
+    sp_returns = sp.pct_change(1)
+    sp_returns = sp_returns.dropna()
+    
+    a = 12 #monthly annualizing factor
+#    a = 52 #weekly annualizing factor   
+
+    sample_inf_meanvar = inf_ratio(stock_returns,sample_weights_meanvar,sp_returns,begin,end,a)
+    print('Information ratio for sample cov matrix mean variance', sample_inf_meanvar)
+    
+    shrunk_inf_meanvar = inf_ratio(stock_returns,shrunk_weights_meanvar,sp_returns,begin,end,a)
+    print('Information ratio for shrunk cov matrix mean variance', shrunk_inf_meanvar)
+    
+    sample_inf_minvar = inf_ratio(stock_returns,sample_weights_minvar,sp_returns,begin,end,a)
+    print('Information ratio for sample cov matrix min variance', sample_inf_minvar)
+    
+    shrunk_inf_minvar = inf_ratio(stock_returns,shrunk_weights_minvar,sp_returns,begin,end,a)
+    print('Information ratio for shrunk cov matrix min variance', shrunk_inf_minvar)
+    
+    pca_inf_meanvar = inf_ratio(stock_returns,pca_weights_meanvar,sp_returns,begin,end,a)
+    print('Information ratio for pca cov matrix mean variance', pca_inf_meanvar)
+    
+    pca_inf_minvar = inf_ratio(stock_returns,pca_weights_minvar,sp_returns,begin,end,a)
+    print('Information ratio for pca cov matrix min variance', pca_inf_minvar)
